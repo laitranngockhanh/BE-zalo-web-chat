@@ -1,0 +1,5 @@
+node_modules/
+data/session.json
+.env
+# Byte gốc file đính kèm lưu trên đĩa (blobStore) — KHÔNG commit dữ liệu người dùng.
+storage/

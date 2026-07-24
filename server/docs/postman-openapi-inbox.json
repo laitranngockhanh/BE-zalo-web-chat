@@ -1,0 +1,2268 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Zalo Clone — Inbox API (cho FE ERP)",
+    "version": "1.0.0",
+    "description": "REST API của **chat server** (Express) cho web client Zalo-clone dùng CSKH.\n\n## Mô hình phiên & xác thực\n- Server giữ **một phiên Zalo chung** cho cả hệ thống. Đăng nhập 1 lần bằng **QR** (`POST /api/auth/qr`) hoặc **credential** (`POST /api/auth/session`); các lời gọi sau **không** cần đăng nhập lại và **thao tác dưới danh nghĩa tài khoản đang đăng nhập**.\n- **API key**: mọi request cần header **`X-Api-Key`** (bấm nút *Authorize* để nhập). 2 cấp key trong `server/.env`: `AGENT_API_KEY` (FE inbox) và `ADMIN_API_KEY` (vận hành). Sai/thiếu → `401`. **Ngoại lệ**: `GET /api/media/*` miễn header (ảnh/audio nạp qua thẻ `<img>/<audio>`). Socket.IO xác thực bằng chính key này qua `auth.token` lúc handshake. Server chưa cấu hình key nào → auth tắt (chỉ dành cho dev một mình).\n- **Phân quyền**: endpoint gắn `x-audience: admin` (provision phiên, đổi tài khoản, xoá hội thoại…) chỉ chấp nhận `ADMIN_API_KEY` — gọi bằng agent key trả `403`. Team FE inbox dùng bộ docs rút gọn tại **`/api-docs/inbox`** (spec: `/api-docs/inbox.json`).\n- Phần lớn endpoint yêu cầu server đã ở trạng thái `authenticated` (kiểm tra `GET /api/auth/status`); nếu chưa, trả `409`.\n- Ảnh QR **không** trả qua REST — nó được đẩy realtime qua **Socket.IO** (event `qr`), cùng với biến động trạng thái (`auth:status`).\n\n## Realtime (Socket.IO) — BẮT BUỘC để app hoạt động\nREST chỉ là một nửa. Tin đến, QR, typing, seen, reaction, thu hồi… **đẩy qua Socket.IO** (cùng cổng, path `/socket.io`). OpenAPI không mô tả được event push nên liệt kê ở đây:\n\n| Event (server→client) | Payload | Ý nghĩa |\n|---|---|---|\n| `qr` | `{ image }` (data URI) | Ảnh QR mới khi đăng nhập |\n| `auth:status` | `{ status, me }` | Đổi trạng thái đăng nhập / socket mới kết nối |\n| `message:new` | `Message` | Tin mới đến hoặc mình gửi |\n| `message:replace` | `{ type, threadId, oldId, message }` | Nâng bản ghi tạm → bản thật (danh thiếp, gợi ý AI đã duyệt) |\n| `message:reaction` | `{ threadId, type, msgId, reactions }` | Thêm/gỡ reaction |\n| `message:undo` | `{ threadId, type, msgId }` | Tin bị thu hồi |\n| `thread:typing` | `{ threadId, type, typingUsers }` | Đang soạn tin |\n| `thread:seen` | `{ threadId, type, seenAt, seenBy }` | Đã xem |\n| `conversation:upsert` | `Conversation` | Hội thoại mới (người lạ nhắn tới) / cập nhật |\n| `group:event` / `friend:event` | `{ type, threadId, data }` | Biến động nhóm / kết bạn |\n\n## Quy ước & lưu ý khi gọi\n- `type`: **0** = chat 1-1, **1** = nhóm. Xuất hiện ở path/param khắp nơi.\n- Nhiều thao tác nhóm/bạn bè/hội thoại chỉ **proxy qua zca-js** nên response là object thô của Zalo (ghi chú `Passthrough`). Các endpoint tin nhắn lõi đã có schema `Message`/`Conversation` thật.\n- **Gửi đính kèm** (`/api/messages/upload`) trả **mảng tin — mỗi file 1 tin** (giống Zalo).\n- **Thu hồi** (`/undo`) cần `cliMsgId` (chỉ có sau khi Zalo echo tin về ~100ms); undo ngay sau khi gửi có thể trượt.\n- **Cài đặt nhóm** (`PATCH /api/groups/{id}/settings`) phải gửi **đủ mọi cờ**; cờ bỏ trống bị coi là tắt.\n- **Nhắc hẹn**: chỉ **đọc** được phản hồi RSVP, không gửi được (giới hạn zca-js).\n- Tầng **AI** (`/api/ai/*`) chỉ trả **gợi ý chờ duyệt** (`status: suggested`); duyệt qua `PATCH …/ai-hint`. Xử lý thật ở `ai-service` tách riêng (cổng 4100).\n- Lỗi luôn dạng `{ error, code? }`. Mã: `400` sai/thiếu tham số · `404` không thấy · `409` chưa đăng nhập · `502` lỗi upstream (Zalo CDN / ai-service)."
+  },
+  "servers": [
+    {
+      "url": "https://unlimited-feedback-crossing-academics.trycloudflare.com",
+      "description": "Qua Cloudflare tunnel (gọi từ máy khác)"
+    },
+    {
+      "url": "http://localhost:4000",
+      "description": "Local trực tiếp tại máy chủ"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Xác thực",
+      "description": "Đăng nhập QR / credential, trạng thái, đăng xuất."
+    },
+    {
+      "name": "Nền tảng",
+      "description": "Trạng thái theo từng nền tảng (unified inbox)."
+    },
+    {
+      "name": "Media",
+      "description": "Proxy & phục vụ byte gốc file đính kèm (ảnh/voice/file)."
+    },
+    {
+      "name": "AI",
+      "description": "Nhận diện ảnh, chép lời, tóm tắt — kết quả là gợi ý chờ duyệt."
+    },
+    {
+      "name": "Hội thoại",
+      "description": "Danh sách + ghim/ẩn/mute/nhãn/đánh dấu đọc/xoá hội thoại."
+    },
+    {
+      "name": "Tin nhắn",
+      "description": "Gửi/nhận, đính kèm, forward, thu hồi, ghim, reaction, typing, seen."
+    },
+    {
+      "name": "Bạn bè",
+      "description": "Danh bạ, kết bạn, chặn, biệt danh, tìm theo SĐT."
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": "AGENT_API_KEY hoặc ADMIN_API_KEY trong `server/.env`. GET /api/media/* được miễn."
+      }
+    },
+    "parameters": {
+      "TypeParam": {
+        "name": "type",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "description": "Loại thread (zca-js ThreadType): **0** = người dùng (chat 1-1), **1** = nhóm."
+      },
+      "ThreadIdParam": {
+        "name": "threadId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "ID hội thoại: uid người dùng hoặc groupId."
+      },
+      "MsgIdParam": {
+        "name": "msgId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "ID tin nhắn (msgId/cliMsgId tuỳ thao tác)."
+      },
+      "PlatformQuery": {
+        "name": "platform",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "zalo"
+        },
+        "description": "Nền tảng đích cho inbox đa kênh. Hiện chỉ `zalo`."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Tham số không hợp lệ / thiếu.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Thiếu hoặc sai API key (header `X-Api-Key`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Thao tác VẬN HÀNH — key hợp lệ nhưng thiếu quyền admin. Cần `ADMIN_API_KEY`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Không tìm thấy.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Chưa đăng nhập tài khoản.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Quá giới hạn số lời gọi AI/phút (đếm chung cả server, giữ quota cho cả đội). `code: rate_limited`. Trạng thái HẾT QUOTA nhà cung cấp cũng trả 429 nhưng `code: quota_exceeded`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Upstream": {
+        "description": "Lỗi từ nền tảng/dịch vụ phụ thuộc (Zalo, ai-service).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Mô tả lỗi (tiếng Việt)."
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "description": "Mã lỗi gốc từ Zalo (nếu có)."
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "Ok": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "example": true
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "Passthrough": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Object thô trả về từ Zalo (zca-js). Cấu trúc tuỳ thao tác."
+      },
+      "AuthStatus": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "Trạng thái phiên: `logged_out` | `waiting_qr` | `logged_in`…"
+          },
+          "me": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true,
+            "description": "Thông tin tài khoản đang đăng nhập."
+          }
+        }
+      },
+      "AiHints": {
+        "type": "object",
+        "description": "Gợi ý AI gắn trên tin nhắn (provenance đầy đủ).",
+        "properties": {
+          "label": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "details": {
+            "type": "string",
+            "nullable": true
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "number",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "promptVersion": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string",
+            "description": "`describe` | `ocr` | `general` | `refine` | `transcribe`."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "suggested",
+              "confirmed",
+              "rejected",
+              "edited"
+            ]
+          },
+          "verifiedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "verifiedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "summary": {
+            "type": "string",
+            "nullable": true
+          },
+          "summaryTags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "Quote": {
+        "type": "object",
+        "description": "Tin được trả lời (reply), nếu có.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string",
+            "description": "Nội dung tin gốc."
+          },
+          "fromId": {
+            "type": "string"
+          }
+        }
+      },
+      "Mention": {
+        "type": "object",
+        "description": "Một @mention trong tin NHÓM. `pos`/`len` là vị trí & độ dài của chuỗi \"@Tên\" trong text (đơn vị UTF-16, khớp String.length của JS — cùng đơn vị zca-js validate).",
+        "properties": {
+          "uid": {
+            "type": "string",
+            "description": "uid thành viên được nhắc. `\"-1\"` = @Tất cả (mention all)."
+          },
+          "pos": {
+            "type": "integer",
+            "description": "Vị trí ký tự bắt đầu của \"@Tên\" trong text (0-based, UTF-16)."
+          },
+          "len": {
+            "type": "integer",
+            "description": "Độ dài chuỗi \"@Tên\" (gồm cả ký tự @)."
+          },
+          "type": {
+            "type": "integer",
+            "nullable": true,
+            "enum": [
+              0,
+              1
+            ],
+            "description": "CHỈ có ở tin NHẬN: 0 = nhắc 1 người, 1 = @Tất cả. Khi GỬI không cần đưa — zca-js tự suy từ uid."
+          }
+        },
+        "required": [
+          "uid",
+          "pos",
+          "len"
+        ]
+      },
+      "Attachment": {
+        "type": "object",
+        "description": "Đính kèm của tin (ảnh/video/file/voice/link/danh thiếp/thẻ NH…). Cấu trúc best-effort từ zca-js.",
+        "additionalProperties": true,
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Loại đính kèm: `photo|video|file|voice|link|card|bankCard|sticker…`"
+          },
+          "href": {
+            "type": "string",
+            "nullable": true,
+            "description": "URL file gốc (CDN Zalo)."
+          },
+          "thumb": {
+            "type": "string",
+            "nullable": true,
+            "description": "URL ảnh thu nhỏ."
+          },
+          "title": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "action": {
+            "type": "string",
+            "nullable": true
+          },
+          "params": {
+            "type": "string",
+            "nullable": true,
+            "description": "JSON string tuỳ loại."
+          },
+          "localAttachments": {
+            "type": "array",
+            "description": "File GỬI ĐI đã mirror trên server — render qua `/api/media/local/{id}`.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "mimeType": {
+                  "type": "string"
+                },
+                "category": {
+                  "type": "string",
+                  "description": "image|video|audio|document|sticker|other"
+                },
+                "size": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "localMedia": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Map field media (href/thumb/…) → localId (UUID) cho tin NHẬN đã mirror."
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "description": "Tin nhắn đã CHUẨN HOÁ (shape thống nhất server↔client, do `_normalizeMessage`). Cũng là payload của socket `message:new`.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "msgId thật từ Zalo."
+          },
+          "cliMsgId": {
+            "type": "string",
+            "nullable": true,
+            "description": "null khi mới gửi; được vá khi Zalo echo về (cần cho thu hồi)."
+          },
+          "platform": {
+            "type": "string",
+            "example": "zalo"
+          },
+          "threadId": {
+            "type": "string",
+            "description": "uid (1-1) hoặc groupId."
+          },
+          "type": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "description": "0=người dùng, 1=nhóm."
+          },
+          "fromId": {
+            "type": "string",
+            "description": "uid người gửi thật (quan trọng trong nhóm)."
+          },
+          "isSelf": {
+            "type": "boolean",
+            "description": "Tin do mình gửi."
+          },
+          "msgType": {
+            "type": "string",
+            "description": "Loại tin: `text|group.photo|group.video|group.voice|group.file|group.poll|chat.ecard…` (không đầy đủ tài liệu)."
+          },
+          "text": {
+            "type": "string",
+            "nullable": true
+          },
+          "attachment": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Attachment"
+              }
+            ],
+            "nullable": true
+          },
+          "quote": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Quote"
+              }
+            ],
+            "nullable": true
+          },
+          "mentions": {
+            "type": "array",
+            "nullable": true,
+            "description": "@mention trong tin nhóm — null nếu không có. `text` ĐÃ chứa đủ tên; mảng này chỉ là vị trí {uid,pos,len,type} để tô sáng/bấm (`type=1` + `uid=\"-1\"` = @Tất cả). Đơn vị pos/len: UTF-16.",
+            "items": {
+              "$ref": "#/components/schemas/Mention"
+            }
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch ms (UTC). Client hiển thị theo múi giờ trình duyệt — team hiện dùng GMT+7."
+          },
+          "reactions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Map emoji → danh sách uid đã thả, vd `{ \"👍\": [\"u1\",\"u2\"] }`."
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "undone": {
+            "type": "boolean",
+            "description": "Đã thu hồi."
+          },
+          "aiHints": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AiHints"
+              }
+            ],
+            "nullable": true,
+            "description": "Gợi ý AI gắn trên tin (nếu có)."
+          }
+        }
+      },
+      "Conversation": {
+        "type": "object",
+        "description": "Một hội thoại trong danh sách (1-1 hoặc nhóm).",
+        "additionalProperties": true,
+        "properties": {
+          "platform": {
+            "type": "string",
+            "example": "zalo"
+          },
+          "type": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "uid (1-1) hoặc groupId."
+          },
+          "name": {
+            "type": "string"
+          },
+          "avatar": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastMessage": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Message"
+              }
+            ],
+            "nullable": true
+          },
+          "unreadCount": {
+            "type": "integer"
+          },
+          "isPinned": {
+            "type": "boolean"
+          },
+          "isMuted": {
+            "type": "boolean"
+          },
+          "isHidden": {
+            "type": "boolean"
+          },
+          "notMember": {
+            "type": "boolean",
+            "description": "true khi mình bị kick/rời nhóm (khoá ô soạn)."
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/auth/status": {
+      "get": {
+        "tags": [
+          "Xác thực"
+        ],
+        "summary": "Trạng thái đăng nhập hiện tại",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/platforms": {
+      "get": {
+        "tags": [
+          "Nền tảng"
+        ],
+        "summary": "Trạng thái theo từng nền tảng",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/media/proxy": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "summary": "Proxy media từ CDN Zalo",
+        "description": "Tải lại media (chỉ host Zalo — chặn SSRF) và trả kèm Content-Length + hỗ trợ Range (tua). Khắc phục voice/file bị cắt ngắn khi phát thẳng từ CDN.",
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "URL gốc trên CDN Zalo."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nội dung media (binary).",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "502": {
+            "$ref": "#/components/responses/Upstream"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/media/local/{id}": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "summary": "Phục vụ byte gốc file đính kèm đã lưu",
+        "description": "Đọc file đã mirror trên server (bảng attachments) theo UUID — không phụ thuộc CDN Zalo. Hỗ trợ Range.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nội dung tệp (binary).",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "description": "Không đọc được tệp.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/ai/status": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Trạng thái quota AI",
+        "description": "Cho client chủ động hỏi (vd lúc mở app) ngoài kênh socket `ai:quota`. `exhausted: true` = AI đang hết quota, các lời gọi AI sẽ trả 429.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "exhausted": {
+                      "type": "boolean"
+                    },
+                    "at": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "provider": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "message": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/ai/analyze-image": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Nhận diện / OCR / mô tả ảnh của một tin",
+        "description": "Lấy byte ảnh đang hiển thị (imageUrl) → gửi ai-service. Có `type`+`threadId`+`msgId` thì **lưu gợi ý lên tin** và đồng bộ realtime để duyệt sau.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "imageUrl": {
+                    "type": "string",
+                    "description": "URL ảnh: `/api/media/local/:id`, `/api/media/proxy?url=` hoặc URL CDN Zalo."
+                  },
+                  "task": {
+                    "type": "string",
+                    "enum": [
+                      "describe",
+                      "ocr",
+                      "general",
+                      "refine"
+                    ],
+                    "default": "describe"
+                  },
+                  "context": {
+                    "type": "string",
+                    "description": "Chỉ dùng khi `task=refine`."
+                  },
+                  "deep": {
+                    "type": "boolean",
+                    "description": "Cờ chẩn đoán sâu cho refine."
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "msgId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "imageUrl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Kết quả gợi ý + tin đã cập nhật (nếu có định danh).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "result": {
+                      "$ref": "#/components/schemas/AiHints"
+                    },
+                    "message": {
+                      "type": "object",
+                      "nullable": true,
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "$ref": "#/components/responses/Upstream"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/ai/transcribe-audio": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Chép lời tin nhắn thoại",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audioUrl": {
+                    "type": "string",
+                    "description": "URL audio (bản mirror hoặc CDN Zalo)."
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "msgId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "audioUrl"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transcript (gợi ý) + tin đã cập nhật.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "result": {
+                      "$ref": "#/components/schemas/AiHints"
+                    },
+                    "message": {
+                      "type": "object",
+                      "nullable": true,
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "$ref": "#/components/responses/Upstream"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/ai/summarize": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Tóm tắt transcript đã chép lời",
+        "description": "Đọc transcript **đã lưu trên tin** (không tin text từ client) → tóm tắt → gắn thêm `summary` vào aiHints.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "msgId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "threadId",
+                  "msgId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tóm tắt + tin đã cập nhật.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "summary": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "message": {
+                      "type": "object",
+                      "nullable": true,
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "502": {
+            "$ref": "#/components/responses/Upstream"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/{type}/{threadId}/{msgId}/ai-hint": {
+      "patch": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Duyệt gợi ý AI (human-in-the-loop)",
+        "description": "Xác nhận / sửa / bỏ / khôi phục gợi ý. Server tự đóng dấu `verifiedBy` + `verifiedAt` (không tin client).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/MsgIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "confirmed",
+                      "rejected",
+                      "edited",
+                      "suggested"
+                    ]
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "Chỉ khi `edited`."
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "Chỉ khi `edited`."
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Đã duyệt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "aiHints": {
+                      "$ref": "#/components/schemas/AiHints"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations": {
+      "get": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Danh sách hội thoại (hợp nhất mọi nền tảng)",
+        "responses": {
+          "200": {
+            "description": "Danh sách",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Conversation"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/labels": {
+      "get": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Danh sách nhãn",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      },
+      "put": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Cập nhật nhãn",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "labelData": {
+                    "description": "Dữ liệu nhãn."
+                  },
+                  "version": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/{type}/{threadId}/pin": {
+      "post": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Ghim hội thoại",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      },
+      "delete": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Bỏ ghim hội thoại",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/{type}/{threadId}/hide": {
+      "post": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Ẩn hội thoại",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      },
+      "delete": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Bỏ ẩn hội thoại",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/{type}/{threadId}/mute": {
+      "post": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Tắt/bật thông báo hội thoại",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Tham số mute (duration…) theo zca-js."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/{type}/{threadId}/unread-mark": {
+      "post": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Đánh dấu chưa đọc",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      },
+      "delete": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Bỏ đánh dấu chưa đọc",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/conversations/{type}/{threadId}/read": {
+      "post": {
+        "tags": [
+          "Hội thoại"
+        ],
+        "summary": "Đặt số tin chưa đọc về 0",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/{type}/{threadId}": {
+      "get": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Lấy tin nhắn của một hội thoại (phân trang lazy-load)",
+        "description": "Không có `before` → trả lô tin **mới nhất** (~50 tin) khi mở hội thoại. Có `before` (ts của tin cũ nhất client đang giữ) → trả lô tin **cũ hơn** để scroll xem lịch sử. `limit` = cỡ lô (mặc định 50). Nhóm: lô đầu kèm đồng bộ lịch sử từ Zalo.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Mốc thời gian (ts, ms) — trả tin CŨ HƠN mốc này (scroll lên). Bỏ trống = lô tin mới nhất."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Số tin mỗi lô (mặc định 50)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Danh sách tin (tăng dần theo thời gian).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Message"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/send": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Gửi tin văn bản",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "quoteMessageId": {
+                    "type": "string",
+                    "description": "ID tin để trả lời (tuỳ chọn)."
+                  },
+                  "styles": {
+                    "type": "array",
+                    "description": "Định dạng text (offset {start,len,...}). Có styles thì text KHÔNG bị trim.",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "mentions": {
+                    "type": "array",
+                    "description": "@mention — CHỈ có tác dụng với nhóm (`type=1`); bị bỏ qua ở chat 1-1. Mỗi phần tử là {uid,pos,len}: `pos`/`len` là vị trí & độ dài của chuỗi \"@Tên\" TRONG `text` (đơn vị UTF-16, khớp String.length của JS). `uid=\"-1\"` = @Tất cả (server/zca-js tự gắn type=1). `text` phải là chuỗi cuối cùng (đã trim) để pos khớp; tổng `len` không được vượt độ dài `text` (nếu không zca-js báo lỗi).",
+                    "items": {
+                      "$ref": "#/components/schemas/Mention"
+                    }
+                  }
+                },
+                "required": [
+                  "threadId",
+                  "type",
+                  "text"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tin đã gửi (đã chuẩn hoá).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/upload": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Gửi đính kèm (tối đa 10 file, 50MB/file)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "binary"
+                    }
+                  },
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "caption": {
+                    "type": "string"
+                  },
+                  "dimensions": {
+                    "type": "string",
+                    "description": "JSON mảng kích thước từng ảnh."
+                  }
+                },
+                "required": [
+                  "files",
+                  "threadId",
+                  "type"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Mảng tin — mỗi file 1 tin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Message"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "413": {
+            "description": "Tệp vượt giới hạn.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/link": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Gửi link (kèm preview)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "link": {
+                    "type": "string"
+                  },
+                  "msg": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "threadId",
+                  "type",
+                  "link"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/sticker": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Gửi sticker",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "sticker": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "threadId",
+                  "type",
+                  "sticker"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/forward": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Chuyển tiếp tới nhiều nơi",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "description": "`voiceUrl` → gửi lại thành voice note thật. `mediaUrl`/`imageUrl` → tải byte gốc rồi gửi thành đính kèm thật. Chỉ `text` → chuyển tiếp văn bản.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "description": "Danh sách nơi nhận (threadId + type)."
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "mediaUrl": {
+                    "type": "string"
+                  },
+                  "imageUrl": {
+                    "type": "string",
+                    "description": "Tương thích ngược = mediaUrl."
+                  },
+                  "filename": {
+                    "type": "string"
+                  },
+                  "voiceUrl": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "targets"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/{type}/{threadId}/{msgId}": {
+      "delete": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Xoá tin nhắn",
+        "description": "`onlyMe=true` (mặc định): xoá phía mình — quyền agent. `onlyMe=false`: xoá CHO MỌI NGƯỜI (không hoàn tác) — cần `ADMIN_API_KEY`, agent key trả `403`.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/MsgIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          },
+          {
+            "name": "onlyMe",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            },
+            "description": "`false` = xoá cho mọi người (cần quyền admin)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/{type}/{threadId}/{msgId}/undo": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Thu hồi tin nhắn của mình",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/MsgIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/messages/{type}/{threadId}/{msgId}/reaction": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Thả / gỡ reaction",
+        "description": "`icon` = chuỗi rỗng nghĩa là GỠ reaction của mình.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TypeParam"
+          },
+          {
+            "$ref": "#/components/parameters/ThreadIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/MsgIdParam"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "icon": {
+                    "type": "string",
+                    "description": "Emoji reaction; \"\" để gỡ."
+                  }
+                },
+                "required": [
+                  "icon"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/typing": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Gửi trạng thái đang gõ",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  }
+                },
+                "required": [
+                  "threadId",
+                  "type"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/seen": {
+      "post": {
+        "tags": [
+          "Tin nhắn"
+        ],
+        "summary": "Đánh dấu đã xem tới một tin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PlatformQuery"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "threadId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      1
+                    ]
+                  },
+                  "msgId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "threadId",
+                  "type",
+                  "msgId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/friends/find": {
+      "get": {
+        "tags": [
+          "Bạn bè"
+        ],
+        "summary": "Tìm người dùng theo SĐT",
+        "parameters": [
+          {
+            "name": "phone",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    },
+    "/api/friends/{friendId}/profile": {
+      "get": {
+        "tags": [
+          "Bạn bè"
+        ],
+        "summary": "Hồ sơ người dùng",
+        "parameters": [
+          {
+            "name": "friendId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Passthrough"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "x-audience": "inbox"
+      }
+    }
+  }
+}
