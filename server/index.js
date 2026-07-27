@@ -11,6 +11,7 @@ import * as db from "./store/db.js";
 import * as chatStore from "./store/chatStore.js";
 import { hub } from "./providers/hub.js";
 import { providerFor } from "./providers/resolve.js";
+import { startPublisher, publishEvent } from "./lib/rabbitPublisher.js";
 import { PROVIDER_EVENTS } from "./providers/MessagingProvider.js";
 import { serveBufferWithRange } from "./lib/rangeStream.js";
 import { analyzeImage, summarizeText, transcribeAudio } from "./lib/aiClient.js";
@@ -139,7 +140,10 @@ const PROVIDER_TO_SOCKET = {
     guard: "guard:state", // { open, retryAfterMs, reason } — client hiện cảnh báo "đang tạm nghỉ tránh bị chặn"
 };
 for (const ev of PROVIDER_EVENTS) {
-    hub.on(ev, (payload) => io.emit(PROVIDER_TO_SOCKET[ev], payload));
+    hub.on(ev, (payload) => {
+        io.emit(PROVIDER_TO_SOCKET[ev], payload); // UI Vue của mình
+        publishEvent(ev, payload); // hệ thống ngoài qua RabbitMQ (no-op nếu chưa cấu hình/nối được broker)
+    });
 }
 
 io.on("connection", (socket) => {
@@ -247,20 +251,53 @@ const ALLOWED_MEDIA_HOSTS = [
     "zcdn.vn",
     "zcdn.me",
     "zmdcdn.me", // sticker
+    "dlmd.me", // video (vd video-stal-23.dlmd.me) — thiếu domain này khiến forward lô có video báo lỗi
+    // "Chỉ nhận media từ CDN Zalo hoặc bản đã lưu trên server" (bug thật user gặp)
+    "dlfl.vn", // file đính kèm (vd fg40.dlfl.vn, share.file) — cùng dạng thiếu whitelist như dlmd.me,
+    // phát hiện khi rà lại toàn bộ domain CDN thật đã lưu trong DB
+    "mdchat.me", // dlmd.me tự 301 sang đây (CÙNG subdomain + path, vd video-stal-23.mdchat.me) — verify
+    // trực tiếp bằng fetch redirect:manual, cùng hạ tầng CDN video Zalo, không phải host lạ
 ];
 function isAllowedMediaHost(hostname) {
     const h = String(hostname).toLowerCase();
     return ALLOWED_MEDIA_HOSTS.some((d) => h === d || h.endsWith("." + d));
 }
 
-// Tải file từ upstream với 3 chốt an toàn: (1) KHÔNG theo redirect (CDN 302 sang host khác là né whitelist
-// → từ chối luôn); (2) timeout 15s; (3) TRẦN kích thước — kiểm Content-Length trước, và vẫn ĐẾM byte khi
-// đọc stream (upstream dùng chunked không khai Content-Length thì cap vẫn có hiệu lực). Trả Buffer đầy đủ
-// vì các nơi dùng (Range/AI/forward) đều cần trọn nội dung trong RAM.
+// Tải file từ upstream với 3 chốt an toàn: (1) redirect chỉ được theo nếu ĐÍCH redirect CŨNG thuộc
+// whitelist (CDN video/file của Zalo hay 302 sang 1 host edge khác VẪN của Zalo — chặn hẳn redirect thì
+// forward video/file luôn lỗi "Upstream trả redirect" dù host gốc hợp lệ; nhưng theo redirect MÙ QUÁNG
+// (không kiểm host đích) thì mất tác dụng chống SSRF — nên tự xử lý thủ công thay vì fetch redirect:
+// "follow", tối đa 3 lần); (2) timeout 15s mỗi lần; (3) TRẦN kích thước — kiểm Content-Length trước, và
+// vẫn ĐẾM byte khi đọc stream (upstream dùng chunked không khai Content-Length thì cap vẫn có hiệu lực).
+// Trả Buffer đầy đủ vì các nơi dùng (Range/AI/forward) đều cần trọn nội dung trong RAM.
+// 60s (thay vì 15s trước đây): timeout CŨ đủ cho ảnh (vài trăm KB) nhưng KHÔNG đủ cho video (thấy thật
+// ~14MB, có lô còn nặng hơn) — hop tải BYTE THẬT (khác các hop redirect chỉ đổi header, gần như tức thì)
+// timeout tại 15s dù kết nối bình thường (bug thật: "The operation was aborted due to timeout" khi forward
+// video). Mỗi hop có AbortSignal.timeout RIÊNG (tạo mới mỗi vòng lặp) nên redirect nhiều lần không cộng dồn
+// timeout của hop cuối.
 async function fetchUpstreamCapped(url, maxBytes = config.mediaProxyMaxBytes) {
-    const upstream = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(15_000) });
-    if (upstream.status >= 300 && upstream.status < 400) {
-        throw Object.assign(new Error("Upstream trả redirect — từ chối (chống né whitelist)"), { status: 502 });
+    let current = url;
+    let upstream;
+    for (let hop = 0; ; hop++) {
+        upstream = await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(60_000) });
+        if (upstream.status < 300 || upstream.status >= 400) break;
+        if (hop >= 3) {
+            throw Object.assign(new Error("Upstream redirect quá nhiều lần — từ chối"), { status: 502 });
+        }
+        const location = upstream.headers.get("location");
+        let next;
+        try {
+            next = new URL(location, current);
+        } catch {
+            throw Object.assign(new Error("Upstream trả redirect không hợp lệ — từ chối"), { status: 502 });
+        }
+        if (!/^https?:$/.test(next.protocol) || !isAllowedMediaHost(next.hostname)) {
+            throw Object.assign(
+                new Error("Upstream trả redirect sang host ngoài whitelist — từ chối (chống né whitelist)"),
+                { status: 502 },
+            );
+        }
+        current = next.href;
     }
     if (!upstream.ok) {
         throw Object.assign(new Error(`Tải media lỗi ${upstream.status}`), { status: 502 });
@@ -768,24 +805,48 @@ app.post("/api/messages/sticker", async (req, res) => {
 
 app.post("/api/messages/forward", async (req, res) => {
     // voiceUrl: tin thoại → gửi lại thành VOICE NOTE thật (sendVoice, tham chiếu URL Zalo CDN, không upload).
-    // mediaUrl (mọi loại khác) — imageUrl giữ tương thích ngược. filename giúp giữ đuôi/tên gốc.
-    const { text, targets, mediaUrl, imageUrl, filename, voiceUrl } = req.body;
+    // mediaUrl (mọi loại khác) — imageUrl giữ tương thích ngược. mediaList = [{url,filename}] cho CẢ LÔ ảnh/
+    // video gửi cùng lúc (MediaGroupBubble) — PHẢI gửi 1 lần (xem forwardMedia) để Zalo thật hiện đúng dạng
+    // album gộp ở phía nhận, KHÔNG lặp forward từng ảnh một (bug đã gặp: bên nhận thấy tách rời từng ảnh).
+    const { text, targets, mediaUrl, imageUrl, mediaList, filename, voiceUrl } = req.body;
     const media = mediaUrl || imageUrl;
     if (!Array.isArray(targets) || targets.length === 0) {
         return res.status(400).json({ error: "Thiếu nơi nhận" });
     }
-    if (!voiceUrl && !media && !text?.trim()) {
+    if (!voiceUrl && !media && !mediaList?.length && !text?.trim()) {
         return res.status(400).json({ error: "Thiếu nội dung" });
     }
 
     console.log(
-        `[forward] voiceUrl=${voiceUrl ? "CÓ (" + voiceUrl.slice(0, 60) + "…)" : "không"} mediaUrl=${media ? "CÓ" : "không"} text=${text ? "CÓ" : "không"}`,
+        `[forward] voiceUrl=${voiceUrl ? "CÓ (" + voiceUrl.slice(0, 60) + "…)" : "không"} mediaUrl=${media ? "CÓ" : "không"} mediaList=${mediaList?.length ?? 0} text=${text ? "CÓ" : "không"}`,
     );
     try {
         // Tin THOẠI: chuyển tiếp thành voice note thật (không phải file .aac). Cần URL Zalo CDN gốc.
         if (voiceUrl) {
             console.log("[forward] → sendVoice");
             return res.json(await providerFor(req).forwardVoice(voiceUrl, targets));
+        }
+        // CẢ LÔ ảnh/video: tải byte TỪNG phần tử song song rồi gửi 1 LẦN (mảng nhiều file) — xem forwardMedia.
+        // allSettled (không phải all): 1 file lỗi/timeout (thường là video, nặng hơn ảnh nhiều) KHÔNG được
+        // kéo sập cả lô — vẫn gửi tiếp phần thành công, chỉ báo rõ phần nào thiếu (bug thật đã gặp: "mất
+        // video" mà không rõ vì sao, do trước đây Promise.all fail-fast huỷ hết khi video timeout).
+        if (mediaList?.length) {
+            const settled = await Promise.allSettled(mediaList.map((m) => resolveMediaBytes(m.url, m.filename)));
+            const files = [];
+            const failed = [];
+            settled.forEach((s, i) => {
+                if (s.status === "fulfilled") {
+                    files.push({ buffer: Buffer.from(s.value.base64, "base64"), mime: s.value.mime, filename: s.value.filename });
+                } else {
+                    failed.push({ filename: mediaList[i].filename, error: s.reason?.message });
+                    console.warn(`[forward] Bỏ qua 1 file lỗi khi tải byte (${mediaList[i].filename}):`, s.reason?.message);
+                }
+            });
+            if (files.length === 0) {
+                return res.status(400).json({ error: "Không tải được file nào trong lô để chuyển tiếp" });
+            }
+            const messages = await providerFor(req).forwardMedia(files, targets);
+            return res.json({ messages, failed: failed.length ? failed : undefined });
         }
         // Tin có ĐÍNH KÈM khác (ảnh/file/video): tải byte gốc rồi gửi lại thành đính kèm THẬT (sendAttachment
         // tự dò loại) — không còn dán link. Tin văn bản: chuyển tiếp text.
@@ -932,6 +993,8 @@ httpServer.listen(PORT, async () => {
     console.log(`[server] Đang chạy tại http://localhost:${PORT}`);
     // Kết nối MongoDB + tạo index nếu chưa có — PHẢI xong trước khi restoreSession() đọc/ghi dữ liệu.
     await db.initSchema();
+    // Mở kết nối RabbitMQ để publish event cho hệ thống ngoài (bỏ qua nếu RABBITMQ_URL trống).
+    startPublisher();
     // Thử dùng lại session (cookie) đã lưu từ lần quét QR trước, nếu có
     await zaloService.restoreSession();
 });

@@ -10,6 +10,7 @@
     },
     "dependencies": {
         "@aws-sdk/client-s3": "^3.1092.0",
+        "amqplib": "^2.0.1",
         "cors": "^2.8.5",
         "dotenv": "^16.4.5",
         "express": "^4.19.2",

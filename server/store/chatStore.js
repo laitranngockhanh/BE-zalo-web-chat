@@ -148,6 +148,23 @@ export async function saveMessages(uid, type, threadId, list, platform = "zalo")
     });
 }
 
+/**
+ * msg_id của tin MỚI NHẤT (theo ts) đã lưu, GỘP MỌI THREAD cùng `type` — dùng làm cursor `lastId` khi gọi
+ * `listener.requestOldMessages(type, lastId)` lúc bù tin offline: truyền `null` (mặc định cũ) khiến Zalo trả
+ * về 1 "trang đầu" mặc định (nghi là snapshot gần nhất Zalo giữ, KHÔNG chắc bao trùm tới hiện tại — xem
+ * [[zca-js-old-messages-backfill]]); truyền đúng msgId cuối cùng ta đã biết may ra khiến Zalo trả đúng phần
+ * "sau mốc này" thay vì trang mặc định. Trả null nếu chưa có tin nào lưu (tài khoản mới / thread rỗng).
+ */
+export async function getLatestMessageId(uid, type, platform = "zalo") {
+    const docs = await collections
+        .messages()
+        .find({ platform, uid, type })
+        .sort({ ts: -1 })
+        .limit(1)
+        .toArray();
+    return docs[0]?.msg_id ?? null;
+}
+
 /** Lấy 1 tin nhắn đã lưu (hoặc null) — dùng khi cần đọc lại nội dung tin để vá/hiển thị (vd aiHints). */
 export async function getMessage(uid, type, threadId, msgId, platform = "zalo") {
     const doc = await collections

@@ -497,9 +497,11 @@ class ZaloService extends EventEmitter {
 
         // Mỗi lần WebSocket mở (lần đầu + MỖI lần tự reconnect sau khi rớt): chủ động kéo tin cũ về để bù
         // các tin đã tới lúc server tắt/mất kết nối. Chờ 1 nhịp cho handshake (cipher_key) hoàn tất trước
-        // khi hỏi — response tin cũ cần cipherKey để giải mã.
+        // khi hỏi — response tin cũ cần cipherKey để giải mã. Delay 4s (thay vì 1.5s trước đây): lúc khởi
+        // động server còn bắn kèm getAllFriends/getAllGroups (client gọi /api/conversations ngay khi mở
+        // trang) — quan sát thực tế thấy 429 rơi đúng khoảng này; giãn ra để không chen vào cửa sổ handshake.
         this.api.listener.on("connected", () => {
-            setTimeout(() => this._backfillMissedMessages(), 1500);
+            setTimeout(() => this._backfillMissedMessages(), 4000);
         });
 
         // Đã đóng HẲN (hết lượt tự retry) — thường do bị kick vì mở Zalo Web/PC nơi khác (mã 3000/3003).
@@ -527,20 +529,29 @@ class ZaloService extends EventEmitter {
     /**
      * Chủ động yêu cầu Zalo trả về các tin CŨ (qua listener.requestOldMessages) để BÙ những tin đã tới
      * trong lúc server offline/mất kết nối. Kết quả về BẤT ĐỒNG BỘ qua sự kiện "old_messages" (gắn ở
-     * _onAuthenticated) — hàm này chỉ GỬI yêu cầu. Truyền lastMsgId=null để lấy lô tin gần nhất; dedup
-     * theo msgId trong _handleIncomingMessage đảm bảo tin đã có không bị nhân đôi.
+     * _onAuthenticated) — hàm này chỉ GỬI yêu cầu. dedup theo msgId trong _handleIncomingMessage đảm bảo
+     * tin đã có không bị nhân đôi.
      *
-     * ⚠ requestOldMessages/old_messages KHÔNG có tài liệu chính thức (xem zca-js-overview.md) — kiểm
-     * chứng phạm vi/độ sâu tin trả về qua log "[zalo] old_messages" khi test bù offline.
+     * ⚠ requestOldMessages/old_messages KHÔNG có tài liệu chính thức (xem zca-js-overview.md).
+     * BẮT BUỘC truyền `lastId` = msgId MỚI NHẤT ta đã biết (gộp mọi thread cùng type, qua getLatestMessageId)
+     * — đã kiểm chứng qua query DB trực tiếp: truyền `null` chỉ trả về 1 trang mặc định (không đảm bảo tới
+     * hiện tại, có lúc toàn tin CŨ đã có sẵn dù log báo "nhận được N tin"); truyền đúng cursor thì Zalo trả
+     * đúng phần tin SAU mốc đó, kể cả tin chỉ vài phút trước.
      */
     async _backfillMissedMessages() {
         if (!this.api?.listener) return;
         if (this._backfillInProgress) return;
         this._backfillInProgress = true;
         try {
-            this.api.listener.requestOldMessages(ThreadType.User, null);
-            this.api.listener.requestOldMessages(ThreadType.Group, null);
-            console.log("[zalo] Đã yêu cầu bù tin cũ (User + Group).");
+            const [lastUserMsgId, lastGroupMsgId] = await Promise.all([
+                chatStore.getLatestMessageId(this.uid, ThreadType.User),
+                chatStore.getLatestMessageId(this.uid, ThreadType.Group),
+            ]);
+            this.api.listener.requestOldMessages(ThreadType.User, lastUserMsgId);
+            this.api.listener.requestOldMessages(ThreadType.Group, lastGroupMsgId);
+            console.log(
+                `[zalo] Đã yêu cầu bù tin cũ (User lastId=${lastUserMsgId}, Group lastId=${lastGroupMsgId}).`,
+            );
         } catch (err) {
             console.warn("[zalo] Không gửi được yêu cầu bù tin cũ:", err.message);
         } finally {
@@ -1439,6 +1450,15 @@ class ZaloService extends EventEmitter {
     async sendAttachment(threadId, type, files, caption, dimensions = []) {
         if (!this.api) throw new Error("Chưa đăng nhập");
 
+        // Cùng quy ước gộp lô hiển thị (group_layout_id/id_in_group/total_item_in_group/is_group_layout)
+        // với tin NHẬN VỀ (xem client/src/utils/mediaGroup.js) — trước đây tin MÌNH gửi/forward không có
+        // các field này (msgType cũng null) nên lô nhiều ảnh/video mình gửi/forward hiện RỜI RẠC từng tin
+        // trên chính web của mình, dù bên nhận (Zalo thật) có thể đã gộp đúng nhờ isMultiFile của zca-js
+        // (bug thật: "web lúc hiện gộp lúc hiện rời" — tin NHẬN thì gộp vì có sẵn params, tin mình GỬI thì
+        // không). groupLayoutId tự sinh — chỉ cần DUY NHẤT trong phạm vi lần gửi này để client gộp đúng,
+        // không cần khớp giá trị thật Zalo gán nội bộ.
+        const groupLayoutId = files.length > 1 ? Date.now() : null;
+
         // Kích thước ảnh: ưu tiên số client đo sẵn; THIẾU thì tự đọc từ buffer (imageSizeOf) — các đường
         // không đi qua web client (Postman/API ngoài, forwardMedia) không gửi dimensions, mà gửi ảnh lên
         // Zalo thiếu width/height thì phía nhận dựng sai tỉ lệ → ảnh méo/biến dạng (bug thật đã gặp).
@@ -1528,12 +1548,25 @@ class ZaloService extends EventEmitter {
                     }
                 }
             }
+            const category = localAttachments[i]?.category;
+            const msgType = category === "image" ? "chat.photo" : category === "video" ? "chat.video.msg" : null;
             messages.push(
                 await this._recordOutgoingMessage(threadId, type, msgId, {
                     text: captionOnSingleImage ? caption : null,
+                    msgType,
                     attachment: {
                         files: [files[i].originalname],
                         localAttachments: localAttachments[i] ? [localAttachments[i]] : [],
+                        ...(groupLayoutId && msgType
+                            ? {
+                                  params: {
+                                      is_group_layout: 1,
+                                      group_layout_id: groupLayoutId,
+                                      id_in_group: i,
+                                      total_item_in_group: files.length,
+                                  },
+                              }
+                            : {}),
                     },
                 }),
             );
@@ -1598,26 +1631,35 @@ class ZaloService extends EventEmitter {
     }
 
     /**
-     * Chuyển tiếp 1 ĐÍNH KÈM (ảnh/voice/file/video) sang nhiều cuộc trò chuyện. zca-js forwardMessage CHỈ bê
-     * được văn bản, nên trước đây media bị chuyển thành 1 dòng link. Ở đây ta GỬI LẠI byte gốc như một đính
-     * kèm thật qua sendAttachment (tự dò loại qua magic bytes; tái dùng máy: lưu byte, ghi tin, dedup echo).
-     * `media` = { buffer, mime, filename }.
+     * Chuyển tiếp 1 HOẶC NHIỀU đính kèm (ảnh/voice/file/video) sang nhiều cuộc trò chuyện. zca-js
+     * forwardMessage CHỈ bê được văn bản, nên trước đây media bị chuyển thành 1 dòng link. Ở đây ta GỬI
+     * LẠI byte gốc như đính kèm thật qua sendAttachment (tự dò loại qua magic bytes; tái dùng máy: lưu
+     * byte, ghi tin, dedup echo). `media` = { buffer, mime, filename } HOẶC mảng nhiều media (1 lô ảnh/
+     * video gửi cùng lúc — xem MediaGroupBubble).
+     *
+     * QUAN TRỌNG khi chuyển tiếp CẢ LÔ: phải gửi TẤT CẢ file trong 1 lần gọi sendAttachment (mảng nhiều
+     * phần tử), KHÔNG lặp forwardMedia riêng từng ảnh — zca-js CHỈ gắn groupLayoutId/isGroupLayout/
+     * idInGroup (để Zalo THẬT hiện đúng dạng album gộp ở phía nhận) khi `attachments.length > 1` TRONG
+     * CÙNG 1 lệnh gửi (xem node_modules/zca-js/dist/apis/sendMessage.js hàm handleAttachment, biến
+     * isMultiFile). Gọi N lần riêng biệt (bug đã gặp — user báo "chuyển lô ảnh mà bên nhận thấy tách rời
+     * từng ảnh") khiến mỗi ảnh thành 1 tin HOÀN TOÀN độc lập, không có tag gộp nào.
      */
     async forwardMedia(media, targets) {
         if (!this.api) throw new Error("Chưa đăng nhập");
-        const file = {
-            buffer: media.buffer,
-            originalname: media.filename || "forward.bin",
-            size: media.buffer.length,
-            mimetype: media.mime || "application/octet-stream",
-        };
+        const mediaList = Array.isArray(media) ? media : [media];
+        const files = mediaList.map((m) => ({
+            buffer: m.buffer,
+            originalname: m.filename || "forward.bin",
+            size: m.buffer.length,
+            mimetype: m.mime || "application/octet-stream",
+        }));
         // FAN-OUT (chống ban): sendAttachment đã tự đi qua circuit breaker; ở đây chỉ GIÃN NHỊP giữa mỗi
         // người nhận (guard.gap) để không bắn 1 loạt. Dùng gap() thay vì pace() để tránh nested-run.
         const list = targets ?? [];
         const messages = [];
         for (let i = 0; i < list.length; i++) {
             const t = list[i];
-            const sent = await this.sendAttachment(String(t.id), Number(t.type), [file], "");
+            const sent = await this.sendAttachment(String(t.id), Number(t.type), files, "");
             messages.push(...sent);
             if (i < list.length - 1) await this.guard.gap();
         }

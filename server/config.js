@@ -60,6 +60,14 @@ export const config = {
         forcePathStyle: process.env.S3_FORCE_PATH_STYLE !== "false",
     },
 
+    // ===== RabbitMQ (publish event realtime cho hệ thống ngoài) =====
+    // App CHỈ nối cổng AMQP (5672) qua `url` — KHÔNG dùng management port 15672 (chỉ là web UI cho người).
+    // Để trống url = TẮT publish (server vẫn chạy). guest/guest chỉ chạy từ localhost; host khác cần user thật.
+    rabbit: {
+        url: process.env.RABBITMQ_URL || "",
+        exchange: process.env.RABBITMQ_EXCHANGE || "zalo.events",
+    },
+
     // CHỐNG QUÉT/BAN (outboundGuard) — phạm vi "chỉ chống fan-out": KHÔNG ghì lại chat tay 1-1, chỉ giãn
     // nhịp thao tác GỬI HÀNG LOẠT (forward/broadcast tới nhiều người/nhóm) và tạm dừng khi Zalo trả lỗi/429
     // (circuit breaker). Xem server/lib/outboundGuard.js.

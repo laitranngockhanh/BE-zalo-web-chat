@@ -1,0 +1,38 @@
+# Chỉ dựng CHAT SERVER + MongoDB (không gồm client/ai-service).
+# Mongo phải là replica set (dù 1 node) vì store dùng transaction — healthcheck tự rs.initiate lần đầu.
+services:
+    mongo:
+        image: mongo:7
+        command: ["--replSet", "rs0", "--bind_ip_all"]
+        volumes:
+            - mongo-data:/data/db
+        healthcheck:
+            test:
+                [
+                    "CMD-SHELL",
+                    "mongosh --quiet --eval \"try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }\" | grep -q 1",
+                ]
+            interval: 5s
+            timeout: 10s
+            retries: 20
+            start_period: 10s
+
+    server:
+        build: .
+        depends_on:
+            mongo:
+                condition: service_healthy
+        environment:
+            PORT: 4000
+            MONGODB_URI: mongodb://mongo:27017/zalo?replicaSet=rs0
+            BLOB_STORAGE_BACKEND: local
+        ports:
+            - "4000:4000"
+        volumes:
+            - server-storage:/app/storage
+            - server-data:/app/data
+
+volumes:
+    mongo-data:
+    server-storage:
+    server-data:
