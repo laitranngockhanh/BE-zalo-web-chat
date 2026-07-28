@@ -12,6 +12,7 @@ import * as chatStore from "./store/chatStore.js";
 import { hub } from "./providers/hub.js";
 import { providerFor } from "./providers/resolve.js";
 import { startPublisher, publishEvent } from "./lib/rabbitPublisher.js";
+import { startCommandConsumer } from "./lib/rabbitCommandConsumer.js";
 import { PROVIDER_EVENTS } from "./providers/MessagingProvider.js";
 import { serveBufferWithRange } from "./lib/rangeStream.js";
 import { analyzeImage, summarizeText, transcribeAudio } from "./lib/aiClient.js";
@@ -175,11 +176,16 @@ app.use("/api-docs", swaggerUi.serveFiles(openapiSpec), swaggerUi.setup(openapiS
 // ------------------------------- REST API -------------------------------
 
 app.get("/api/auth/status", (_req, res) => {
-    res.json({ status: zaloService.status, me: zaloService.me });
+    // qrImage kèm vào ĐÂY (không chỉ đẩy qua Socket.IO) để hệ thống NGOÀI đi RE+RabbitMQ (không nối
+    // Socket.IO của gateway) vẫn LẤY được ảnh QR bằng cách poll endpoint này. Luồng FE của họ:
+    // POST /api/auth/qr → poll GET /api/auth/status tới khi có qrImage (hiện lên cho quét) → tới khi
+    // status="authenticated" (xong). status: idle|qr_pending|qr_scanned|switching|authenticated|qr_expired|qr_declined|error
+    res.json({ status: zaloService.status, me: zaloService.me, qrImage: zaloService.qrImage ?? null });
 });
 
 app.post("/api/auth/qr", requireAdmin, async (_req, res) => {
-    // Không await trọn luồng: kết quả sẽ được đẩy dần qua socket (qr -> status)
+    // Không await trọn luồng: ảnh QR + trạng thái đẩy dần qua socket (cho client của mình) VÀ lộ ra ở
+    // GET /api/auth/status (cho FE ngoài poll). requireAdmin: đây là thao tác điều khiển phiên Zalo chung.
     zaloService.startQrLogin();
     res.json({ ok: true });
 });
@@ -808,12 +814,14 @@ app.post("/api/messages/forward", async (req, res) => {
     // mediaUrl (mọi loại khác) — imageUrl giữ tương thích ngược. mediaList = [{url,filename}] cho CẢ LÔ ảnh/
     // video gửi cùng lúc (MediaGroupBubble) — PHẢI gửi 1 lần (xem forwardMedia) để Zalo thật hiện đúng dạng
     // album gộp ở phía nhận, KHÔNG lặp forward từng ảnh một (bug đã gặp: bên nhận thấy tách rời từng ảnh).
-    const { text, targets, mediaUrl, imageUrl, mediaList, filename, voiceUrl } = req.body;
+    // videoUrl (+thumbnailUrl/dims): tin VIDEO → gửi lại thành VIDEO thật (sendVideo, tham chiếu URL Zalo CDN,
+    // KHÔNG tải byte). Video KHÔNG đi qua sendAttachment được (đường đó chỉ hợp ảnh/file).
+    const { text, targets, mediaUrl, imageUrl, mediaList, filename, voiceUrl, videoUrl, thumbnailUrl, videoDuration, videoWidth, videoHeight } = req.body;
     const media = mediaUrl || imageUrl;
     if (!Array.isArray(targets) || targets.length === 0) {
         return res.status(400).json({ error: "Thiếu nơi nhận" });
     }
-    if (!voiceUrl && !media && !mediaList?.length && !text?.trim()) {
+    if (!voiceUrl && !videoUrl && !media && !mediaList?.length && !text?.trim()) {
         return res.status(400).json({ error: "Thiếu nội dung" });
     }
 
@@ -826,26 +834,66 @@ app.post("/api/messages/forward", async (req, res) => {
             console.log("[forward] → sendVoice");
             return res.json(await providerFor(req).forwardVoice(voiceUrl, targets));
         }
+        // Tin VIDEO (đơn): gửi lại thành video thật qua sendVideo — tham chiếu URL Zalo CDN, không tải byte.
+        if (videoUrl) {
+            console.log("[forward] → sendVideo");
+            return res.json(
+                await providerFor(req).forwardVideo(
+                    { videoUrl, thumbnailUrl, duration: videoDuration, width: videoWidth, height: videoHeight, msg: text?.trim() || undefined },
+                    targets,
+                ),
+            );
+        }
         // CẢ LÔ ảnh/video: tải byte TỪNG phần tử song song rồi gửi 1 LẦN (mảng nhiều file) — xem forwardMedia.
         // allSettled (không phải all): 1 file lỗi/timeout (thường là video, nặng hơn ảnh nhiều) KHÔNG được
         // kéo sập cả lô — vẫn gửi tiếp phần thành công, chỉ báo rõ phần nào thiếu (bug thật đã gặp: "mất
         // video" mà không rõ vì sao, do trước đây Promise.all fail-fast huỷ hết khi video timeout).
         if (mediaList?.length) {
-            const settled = await Promise.allSettled(mediaList.map((m) => resolveMediaBytes(m.url, m.filename)));
-            const files = [];
+            const svc = providerFor(req);
+            const videoItems = mediaList.filter((m) => m.videoUrl); // video: sendVideo tham chiếu URL (KHÔNG tải)
+            const fileItems = mediaList.filter((m) => !m.videoUrl); // ảnh/file: tải byte rồi gửi 1 LẦN (gộp album)
+            const messages = [];
             const failed = [];
-            settled.forEach((s, i) => {
-                if (s.status === "fulfilled") {
-                    files.push({ buffer: Buffer.from(s.value.base64, "base64"), mime: s.value.mime, filename: s.value.filename });
-                } else {
-                    failed.push({ filename: mediaList[i].filename, error: s.reason?.message });
-                    console.warn(`[forward] Bỏ qua 1 file lỗi khi tải byte (${mediaList[i].filename}):`, s.reason?.message);
+
+            // Thứ tự: ẢNH (album) TRƯỚC, VIDEO SAU. Ảnh phải tải byte + upload lại (Zalo không cho forward ảnh
+            // bằng URL), còn video chỉ tham chiếu URL nên gửi tức thì. Nếu gửi video trước, nó "vượt" lên đầu rồi
+            // ảnh mới lục tục tới sau vài giây → lô lộn xộn. Gửi ảnh trước giữ đúng thứ tự album-rồi-video.
+
+            // Ảnh/file: tải byte song song (allSettled — 1 file lỗi không kéo sập lô) rồi gửi 1 LẦN để Zalo gộp album.
+            if (fileItems.length) {
+                const settled = await Promise.allSettled(fileItems.map((m) => resolveMediaBytes(m.url, m.filename)));
+                const files = [];
+                settled.forEach((s, i) => {
+                    if (s.status === "fulfilled") {
+                        files.push({ buffer: Buffer.from(s.value.base64, "base64"), mime: s.value.mime, filename: s.value.filename });
+                    } else {
+                        failed.push({ filename: fileItems[i].filename, error: s.reason?.message });
+                        console.warn(`[forward] Bỏ qua 1 file lỗi khi tải byte (${fileItems[i].filename}):`, s.reason?.message);
+                    }
+                });
+                if (files.length) {
+                    const sent = await svc.forwardMedia(files, targets);
+                    messages.push(...(Array.isArray(sent) ? sent : [sent]));
                 }
-            });
-            if (files.length === 0) {
-                return res.status(400).json({ error: "Không tải được file nào trong lô để chuyển tiếp" });
             }
-            const messages = await providerFor(req).forwardMedia(files, targets);
+
+            // Video trong lô: gửi từng cái qua sendVideo (zca-js tách video khỏi album ảnh — không gộp chung được).
+            for (const v of videoItems) {
+                try {
+                    const sent = await svc.forwardVideo(
+                        { videoUrl: v.videoUrl, thumbnailUrl: v.thumbnailUrl, duration: v.duration, width: v.width, height: v.height },
+                        targets,
+                    );
+                    messages.push(...(Array.isArray(sent) ? sent : [sent]));
+                } catch (err) {
+                    failed.push({ filename: v.filename || "video", error: err.message });
+                    console.warn("[forward] video lỗi:", err.message);
+                }
+            }
+
+            if (messages.length === 0) {
+                return res.status(400).json({ error: "Không chuyển tiếp được nội dung nào trong lô" });
+            }
             return res.json({ messages, failed: failed.length ? failed : undefined });
         }
         // Tin có ĐÍNH KÈM khác (ảnh/file/video): tải byte gốc rồi gửi lại thành đính kèm THẬT (sendAttachment
@@ -995,6 +1043,8 @@ httpServer.listen(PORT, async () => {
     await db.initSchema();
     // Mở kết nối RabbitMQ để publish event cho hệ thống ngoài (bỏ qua nếu RABBITMQ_URL trống).
     startPublisher();
+    // Consume lệnh GỬI đến từ hệ thống ngoài qua RabbitMQ (chiều gửi 2-way, thay REST). Bỏ qua nếu URL trống.
+    startCommandConsumer();
     // Thử dùng lại session (cookie) đã lưu từ lần quét QR trước, nếu có
     await zaloService.restoreSession();
 });

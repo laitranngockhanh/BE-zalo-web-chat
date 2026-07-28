@@ -1685,6 +1685,42 @@ class ZaloService extends EventEmitter {
         });
     }
 
+    /**
+     * Chuyển tiếp VIDEO. zca-js `sendMessage({attachments})` (đường của sendAttachment) chỉ hợp ẢNH/FILE —
+     * gửi video qua đó KHÔNG được (bug thật: forward video web→Zalo thất bại). Zalo có API RIÊNG `sendVideo`
+     * nhận `videoUrl`+`thumbnailUrl` THAM CHIẾU URL (giống forwardVoice), KHÔNG tải/upload byte → vừa gửi
+     * đúng dạng video vừa nhanh (không kéo file nặng làm treo). URL phải là CDN Zalo tự truy cập được.
+     */
+    async forwardVideo(video, targets) {
+        if (!this.api) throw new Error("Chưa đăng nhập");
+        const { videoUrl, thumbnailUrl, duration, width, height, msg } = video ?? {};
+        if (!videoUrl || !thumbnailUrl) throw new Error("Thiếu videoUrl/thumbnailUrl để chuyển tiếp video");
+        // FAN-OUT (chống ban): gửi tới TỪNG đích qua guard.pace (giãn nhịp + circuit breaker) như forwardVoice.
+        return this.guard.pace(targets ?? [], async (t) => {
+            const result = await this.api.sendVideo(
+                {
+                    videoUrl,
+                    thumbnailUrl,
+                    ...(msg ? { msg } : {}),
+                    ...(Number(duration) ? { duration: Number(duration) } : {}),
+                    ...(Number(width) ? { width: Number(width) } : {}),
+                    ...(Number(height) ? { height: Number(height) } : {}),
+                },
+                String(t.id),
+                Number(t.type),
+            );
+            // Ghi tin cho phía mình xem — msgType chat.video.msg + href/thumb để client render thẻ <video>.
+            return this._recordOutgoingMessage(String(t.id), Number(t.type), result.msgId, {
+                msgType: "chat.video.msg",
+                attachment: {
+                    href: videoUrl,
+                    thumb: thumbnailUrl,
+                    ...(Number(duration) ? { params: JSON.stringify({ duration: Number(duration) }) } : {}),
+                },
+            });
+        });
+    }
+
     async deleteMessage(threadId, type, message, onlyMe = true) {
         if (!this.api) throw new Error("Chưa đăng nhập");
         await this.api.deleteMessage(
@@ -2115,7 +2151,23 @@ class ZaloService extends EventEmitter {
 
     async createReminder(threadId, type, options) {
         if (!this.api) throw new Error("Chưa đăng nhập");
-        const result = await this.api.createReminder(options, threadId, type);
+        let result;
+        try {
+            result = await this.api.createReminder(options, threadId, type);
+        } catch (err) {
+            // Zalo từ chối → err.message có thể rỗng/"null" (error_message thiếu). Log nguyên văn + code để
+            // chẩn đoán, rồi ném lỗi CÓ NGHĨA thay cho chữ "null" mù mờ nổi lên toast.
+            console.error(`[zalo] createReminder(thread=${threadId}, type=${type}) bị Zalo từ chối:`, {
+                message: err?.message, code: err?.code, options,
+            });
+            const code = err?.code != null ? ` (mã ${err.code})` : "";
+            throw new Error(`Zalo từ chối tạo nhắc hẹn${code}. Thường gặp khi tạo nhắc hẹn 1-1 với người chưa kết bạn, hoặc mốc thời gian không hợp lệ.`);
+        }
+        // Có trường hợp Zalo trả "thành công" nhưng data rỗng → result null → đọc .reminderId sẽ ném lỗi khó hiểu.
+        if (!result || typeof result !== "object") {
+            console.error(`[zalo] createReminder trả dữ liệu rỗng:`, result);
+            throw new Error("Zalo không trả về thông tin nhắc hẹn (dữ liệu rỗng).");
+        }
         const reminderId = result.reminderId ?? result.id;
         await chatStore.saveReminder(this.uid, { reminderId, threadId, type, ...result });
 

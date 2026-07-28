@@ -4,6 +4,7 @@ import amqp from "amqplib";
 
 import { config } from "../config.js";
 import { hub } from "../providers/hub.js";
+import { attachCliMsgId } from "./outboundCorrelation.js";
 
 // PUBLISHER: đẩy event realtime của gateway ra RabbitMQ cho HỆ THỐNG NGOÀI (đồng nghiệp) consume. Cắm SONG
 // SONG với io.emit (Socket.IO cho UI của mình) — nghe CÙNG bộ event từ hub, KHÔNG đụng lõi zca-js/normalize.
@@ -90,13 +91,16 @@ export function publishEvent(hubEvent, payload) {
         return;
     }
     const platform = payload?.platform || "zalo";
+    // Tin GỬI ĐI theo lệnh ERP phải mang lại cliMsgId của họ, nếu không tin kẹt "đang gửi" + lưu trùng bên
+    // họ (xem outboundCorrelation.js). Chỉ áp cho event tin nhắn; các event khác đi thẳng.
+    const data = hubEvent === "message" || hubEvent === "message:replace" ? attachCliMsgId(payload) : payload;
     const envelope = {
         id: "evt_" + randomUUID(),
         type: map.type,
         platform,
         accountUid: hub.get(platform)?.uid ?? null,
         ts: Date.now(),
-        data: payload,
+        data,
     };
     try {
         channel.publish(config.rabbit.exchange, map.rk, Buffer.from(JSON.stringify(envelope)), {
