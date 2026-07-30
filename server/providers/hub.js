@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 
+import { facebookProvider } from "./facebook.js";
 import { PROVIDER_EVENTS } from "./MessagingProvider.js";
 import { zaloProvider } from "./zalo.js";
 
@@ -81,3 +82,12 @@ export const hub = new ProviderHub();
 
 // Đăng ký provider Zalo (nền tảng đang implement thật). Thêm nền tảng khác sau: hub.register(...).
 hub.register(zaloProvider);
+
+// Facebook Fanpage — CHỈ đăng ký khi đã cấu hình token+secret. Chưa cấu hình mà vẫn đăng ký thì publisher
+// sẽ dựng queue lệnh `facebook.gateway.commands` và webhook mở ra dù không dùng được ⇒ rác + gây hiểu nhầm.
+if (facebookProvider.enabled) {
+    hub.register(facebookProvider);
+    console.log("[hub] Đã cắm kênh Facebook (Page id:", facebookProvider.uid ?? "chưa đặt FB_PAGE_ID", ").");
+} else {
+    console.log("[hub] Kênh Facebook TẮT (chưa có FB_PAGE_TOKEN/FB_APP_SECRET trong .env).");
+}

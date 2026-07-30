@@ -1,5 +1,10 @@
 node_modules/
 data/session.json
+# Chặn MỌI biến thể .env (bản sao lưu, .env.local, .env.prod...) vì chúng chứa credential thật.
+# Chỉ .env.example được commit. Trước đây chỉ chặn đúng ".env" nên bản sao lưu kiểu
+# .env.backup-* lọt lưới — đã suýt push credential lên GitHub công khai.
 .env
+.env.*
+!.env.example
 # Byte gốc file đính kèm lưu trên đĩa (blobStore) — KHÔNG commit dữ liệu người dùng.
 storage/

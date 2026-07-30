@@ -10,6 +10,7 @@ import { openapiSpec, inboxSpec } from "./docs/openapi.js";
 import * as db from "./store/db.js";
 import * as chatStore from "./store/chatStore.js";
 import { hub } from "./providers/hub.js";
+import { facebookProvider } from "./providers/facebook.js";
 import { providerFor } from "./providers/resolve.js";
 import { startPublisher, publishEvent } from "./lib/rabbitPublisher.js";
 import { startCommandConsumer } from "./lib/rabbitCommandConsumer.js";
@@ -39,6 +40,14 @@ const upload = multer({
     },
 });
 
+// LƯỚI AN TOÀN: gateway phải sống 24/7 (listener Zalo tắt = mất tin trong lúc chết). Từ Node 15, một
+// promise reject KHÔNG AI BẮT sẽ GIẾT tiến trình — chỉ cần 1 chỗ quên `.catch()` là sập cả gateway.
+// Log rồi CHẠY TIẾP: promise reject không làm hỏng state toàn cục, giữ máy sống đáng giá hơn.
+// (KHÔNG bắt `uncaughtException`: Node vốn đã tự thoát, và chạy tiếp sau đó là không an toàn.)
+process.on("unhandledRejection", (reason) => {
+    console.error("[fatal] Unhandled rejection — đã bỏ qua để giữ gateway sống:", reason);
+});
+
 const app = express();
 
 // CORS whitelist: có ALLOWED_ORIGINS → chỉ các origin đó được gọi từ trình duyệt (Express + Socket.IO cùng
@@ -49,7 +58,9 @@ if (CORS_ORIGIN === "*") {
     console.warn("[cors] ⚠ CHƯA đặt ALLOWED_ORIGINS trong server/.env — mọi origin đều gọi được API từ trình duyệt.");
 }
 app.use(cors({ origin: CORS_ORIGIN }));
-app.use(express.json());
+// `verify` giữ lại BODY THÔ: chữ ký webhook Facebook là HMAC trên ĐÚNG byte gốc — ký lại trên object đã
+// JSON.stringify sẽ ra chuỗi khác (thứ tự/khoảng trắng) ⇒ verify luôn sai. Chỉ tốn thêm 1 tham chiếu Buffer.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ===== Auth API key (bước 1 — sau này thay bằng JWT từ ERP) =====
 // Bật khi CÓ ít nhất 1 key trong .env (AGENT_API_KEY / ADMIN_API_KEY). Không có key nào → cho qua hết
@@ -172,6 +183,44 @@ app.get("/api-docs.json", (_req, res) => res.json(openapiSpec));
 app.get("/api-docs/inbox.json", (_req, res) => res.json(inboxSpec));
 app.use("/api-docs/inbox", swaggerUi.serveFiles(inboxSpec), swaggerUi.setup(inboxSpec, { customSiteTitle: "Zalo Clone — Inbox API (FE ERP)" }));
 app.use("/api-docs", swaggerUi.serveFiles(openapiSpec), swaggerUi.setup(openapiSpec, { customSiteTitle: "Zalo Clone — Chat Server API" }));
+
+// --------------------------- WEBHOOK FACEBOOK ---------------------------
+// Đặt NGOÀI "/api" nên KHÔNG dính middleware API key — đúng ý: người gọi là MÁY CHỦ META, không có key của
+// mình. Bù lại phải tự xác thực bằng CHỮ KÝ HMAC (verifySignature), nếu không ai biết URL cũng bơm được
+// tin giả. Kênh tắt (chưa cấu hình .env) thì trả 404 như thể không tồn tại.
+
+/** Bắt tay lúc đăng ký webhook trên Meta: trả lại challenge nếu verify token khớp chuỗi trong .env. */
+app.get("/webhooks/facebook", (req, res) => {
+    if (!facebookProvider.enabled) return res.sendStatus(404);
+    const challenge = facebookProvider.verifyWebhookChallenge(req.query);
+    if (challenge === null) {
+        console.warn("[fb] Verify webhook THẤT BẠI — verify token không khớp FB_VERIFY_TOKEN.");
+        return res.sendStatus(403);
+    }
+    console.log("[fb] Verify webhook THÀNH CÔNG.");
+    res.status(200).send(challenge);
+});
+
+/** Nhận sự kiện tin nhắn. */
+app.post("/webhooks/facebook", (req, res) => {
+    if (!facebookProvider.enabled) return res.sendStatus(404);
+
+    if (!facebookProvider.verifySignature(req.rawBody, req.get("X-Hub-Signature-256"))) {
+        console.warn("[fb] Chữ ký webhook SAI → từ chối (kiểm FB_APP_SECRET có đúng app không).");
+        return res.sendStatus(403);
+    }
+
+    // TRẢ 200 NGAY rồi mới xử lý: Meta chờ phản hồi trong vài giây, chậm là nó retry rồi TỰ TẮT webhook
+    // của mình. Xử lý nặng (chuẩn hoá, publish RabbitMQ) đẩy ra sau khi đã đóng response.
+    res.sendStatus(200);
+    setImmediate(() => {
+        try {
+            facebookProvider.handleWebhookPayload(req.body);
+        } catch (err) {
+            console.error("[fb] Lỗi xử lý webhook payload:", err.message);
+        }
+    });
+});
 
 // ------------------------------- REST API -------------------------------
 
@@ -735,6 +784,33 @@ app.post("/api/messages/send", async (req, res) => {
     }
 });
 
+// [CHẨN ĐOÁN TẠM] CHỈ upload byte lên CDN Zalo, KHÔNG gửi tin cho ai — trả về NGUYÊN VĂN thứ zca-js
+// `uploadAttachment` nhận được, để xem Zalo cấp URL gì ngay tại bước upload (ảnh: normalUrl/hdUrl/thumbUrl;
+// video/file: fileUrl về qua WebSocket callback nên chậm hơn — `elapsedMs` cho thấy rõ chênh lệch).
+// requireAdmin: đây là thao tác chẩn đoán, không phải API nghiệp vụ. GỠ sau khi chốt xong thiết kế.
+app.post("/api/_debug/upload", requireAdmin, upload.array("files", 10), async (req, res) => {
+    const { threadId, type } = req.body;
+    if (!threadId || type === undefined || !req.files?.length) {
+        return res.status(400).json({ error: "Thiếu threadId, type hoặc file đính kèm" });
+    }
+    try {
+        const svc = providerFor(req);
+        // Kênh chưa hỗ trợ → báo RÕ thay vì để văng "svc.uploadAttachmentOnly is not a function".
+        if (typeof svc.uploadAttachmentOnly !== "function") {
+            return res.status(400).json({ error: `Nền tảng '${svc.platform}' không hỗ trợ upload thử` });
+        }
+        const startedAt = Date.now();
+        const result = await svc.uploadAttachmentOnly(threadId, Number(type), req.files);
+        res.json({
+            elapsedMs: Date.now() - startedAt,
+            count: Array.isArray(result) ? result.length : 0,
+            result,
+        });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
 app.post("/api/messages/upload", upload.array("files", 10), async (req, res) => {
     const { threadId, type, caption, dimensions } = req.body;
 
@@ -754,6 +830,77 @@ app.post("/api/messages/upload", upload.array("files", 10), async (req, res) => 
         res.json(message);
     } catch (err) {
         res.status(400).json({ error: err.message });
+    }
+});
+
+/**
+ * Nhận field có thể là MẢNG (body JSON) hoặc CHUỖI JSON (multipart — form-data chỉ truyền được chuỗi).
+ * Chuỗi hỏng → trả null để bên gọi coi như không truyền, KHÔNG làm sập cả request.
+ */
+function parseMaybeJson(value) {
+    if (value == null || Array.isArray(value) || typeof value === "object") return value ?? null;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
+// ENDPOINT GỘP — MỘT đường cho MỌI kênh và MỌI loại nội dung. Tự nhận biết theo request:
+//   có `files`            → gửi đính kèm (text đi kèm làm caption)
+//   không `files`, có text → gửi tin văn bản
+// `platform` (body/query, mặc định 'zalo') định tuyến tới đúng provider — thêm kênh KHÔNG sinh endpoint mới.
+// multer bỏ qua request không phải multipart nên JSON vẫn chạy bình thường qua chính route này.
+// Hai endpoint cũ /messages/send và /messages/upload GIỮ NGUYÊN (web client + tài liệu cũ đang dùng).
+app.post("/api/messages", upload.array("files", 10), async (req, res) => {
+    const { threadId, type, text, caption, dimensions, quoteMessageId, styles, mentions } = req.body ?? {};
+    const files = req.files ?? [];
+    // Multipart gửi mọi thứ dưới dạng chuỗi: caption và text là MỘT khái niệm ở đây (chú thích đính kèm /
+    // nội dung tin), nhận cả hai tên để bên gọi dùng tên nào cũng được.
+    const body = typeof text === "string" && text.length ? text : typeof caption === "string" ? caption : "";
+
+    if (!threadId || type === undefined) {
+        return res.status(400).json({ error: "Thiếu threadId hoặc type" });
+    }
+    if (files.length === 0 && !body.trim()) {
+        return res.status(400).json({ error: "Cần có `text` hoặc `files`" });
+    }
+
+    try {
+        const svc = providerFor(req);
+
+        if (files.length > 0) {
+            // Kênh chưa hỗ trợ đính kèm (vd Facebook hiện chỉ có text) → báo RÕ, thay vì để văng
+            // "svc.sendAttachment is not a function" khiến bên gọi không hiểu vì sao.
+            if (typeof svc.sendAttachment !== "function") {
+                return res.status(400).json({ error: `Nền tảng '${svc.platform}' chưa hỗ trợ gửi đính kèm` });
+            }
+            let dims = [];
+            try {
+                dims = dimensions ? JSON.parse(dimensions) : [];
+            } catch {
+                dims = []; // dimensions lỗi chỉ mất tối ưu kích thước, server tự đọc lại từ buffer
+            }
+            const messages = await svc.sendAttachment(threadId, Number(type), files, body || undefined, dims);
+            return res.json({ ok: true, messages: Array.isArray(messages) ? messages : [messages] });
+        }
+
+        // Chỉ văn bản. Giữ nguyên text (không trim) khi có styles để offset {start,len} không xê dịch.
+        const parsedStyles = parseMaybeJson(styles);
+        const parsedMentions = parseMaybeJson(mentions);
+        const hasStyles = Array.isArray(parsedStyles) && parsedStyles.length > 0;
+        const quote = quoteMessageId ? await svc.findMessage(Number(type), threadId, quoteMessageId) : null;
+        const message = await svc.sendMessage(
+            threadId,
+            Number(type),
+            hasStyles ? body : body.trim(),
+            quote,
+            hasStyles ? parsedStyles : undefined,
+            Array.isArray(parsedMentions) && parsedMentions.length ? parsedMentions : undefined,
+        );
+        res.json({ ok: true, messages: [message] });
+    } catch (err) {
+        res.status(400).json({ error: err.message, code: err.code ?? null });
     }
 });
 

@@ -15,15 +15,20 @@ import { attachCliMsgId } from "./outboundCorrelation.js";
 //
 // CHỈ đẩy event TRẠNG THÁI BỀN. Bỏ: typing/seen (phù du — nhét queue bền vô nghĩa), qr/status (auth nội bộ),
 // guard (ops nội bộ). Muốn đẩy thêm loại nào → thêm 1 dòng vào EVENT_MAP.
+//
+// ĐA KÊNH: MỘT exchange dùng chung, phân kênh bằng ROUTING KEY `<platform>.<suffix>` (zalo.message.new,
+// facebook.message.new…). Hệ thống ngoài chỉ cần bind 1 exchange — muốn tách kênh thì tạo queue riêng bind
+// `zalo.#` / `facebook.#`, muốn gộp thì bind `#`. Zalo giữ NGUYÊN routing key cũ → ERP đang chạy không đổi gì.
 const EVENT_MAP = {
-    message: { type: "message:new", rk: "zalo.message.new" },
-    "message:replace": { type: "message:replace", rk: "zalo.message.replace" },
-    reaction: { type: "message:reaction", rk: "zalo.message.reaction" },
-    undo: { type: "message:undo", rk: "zalo.message.undo" },
-    conversation: { type: "conversation:upsert", rk: "zalo.conversation.upsert" },
-    group_event: { type: "group:event", rk: "zalo.group.event" },
-    friend_event: { type: "friend:event", rk: "zalo.friend.event" },
+    message: { type: "message:new", rk: "message.new" },
+    "message:replace": { type: "message:replace", rk: "message.replace" },
+    reaction: { type: "message:reaction", rk: "message.reaction" },
+    undo: { type: "message:undo", rk: "message.undo" },
+    conversation: { type: "conversation:upsert", rk: "conversation.upsert" },
+    group_event: { type: "group:event", rk: "group.event" },
+    friend_event: { type: "friend:event", rk: "friend.event" },
 };
+
 
 let connection = null;
 let channel = null;
@@ -55,7 +60,10 @@ async function connect() {
         channel = await connection.createChannel();
         await channel.assertExchange(config.rabbit.exchange, "topic", { durable: true });
         reconnectDelay = 1000;
-        console.log(`[rabbit] Đã nối broker, exchange "${config.rabbit.exchange}" (topic, durable).`);
+        const platforms = hub.list().map((p) => p.platform);
+        console.log(
+            `[rabbit] Đã nối broker, exchange "${config.rabbit.exchange}" (topic, durable). Kênh: ${platforms.join(", ")}.`,
+        );
         if (dropCount > 0) {
             console.warn(`[rabbit] Đã bỏ ${dropCount} event trong lúc chưa nối được broker.`);
             dropCount = 0;
@@ -103,7 +111,7 @@ export function publishEvent(hubEvent, payload) {
         data,
     };
     try {
-        channel.publish(config.rabbit.exchange, map.rk, Buffer.from(JSON.stringify(envelope)), {
+        channel.publish(config.rabbit.exchange, `${platform}.${map.rk}`, Buffer.from(JSON.stringify(envelope)), {
             contentType: "application/json",
             messageId: envelope.id,
             persistent: true,

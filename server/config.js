@@ -63,9 +63,36 @@ export const config = {
     // ===== RabbitMQ (publish event realtime cho hệ thống ngoài) =====
     // App CHỈ nối cổng AMQP (5672) qua `url` — KHÔNG dùng management port 15672 (chỉ là web UI cho người).
     // Để trống url = TẮT publish (server vẫn chạy). guest/guest chỉ chạy từ localhost; host khác cần user thật.
+    // MỘT exchange dùng CHUNG cho MỌI kênh (zalo, facebook…), phân kênh bằng ROUTING KEY `<platform>.*` —
+    // hệ thống ngoài chỉ publish/bind 1 chỗ, còn gateway vẫn có QUEUE RIÊNG từng kênh (tách biệt, không
+    // kênh nào chặn kênh nào). Tên mặc định giữ `zalo.*` để cấu hình ERP ĐANG CHẠY không phải đổi gì; muốn
+    // đổi sang tên trung lập (chat.events/chat.commands) thì chỉnh env, hai bên đổi CÙNG LÚC.
     rabbit: {
         url: process.env.RABBITMQ_URL || "",
         exchange: process.env.RABBITMQ_EXCHANGE || "zalo.events",
+        commandExchange: process.env.RABBITMQ_COMMAND_EXCHANGE || "zalo.commands",
+    },
+
+    // Trần thời gian cho MỘT lần gửi đính kèm lên Zalo. Cần vì zca-js chờ Zalo bắn callback qua WebSocket
+    // mới biết video/file upload xong — mà chỗ chờ đó KHÔNG có timeout, không reject: callback không tới
+    // (listener vừa reconnect / Zalo bỏ rơi) thì promise treo VĨNH VIỄN, giữ luôn request HTTP.
+    // 120s: đủ rộng cho video lớn upload thật, nhưng không để treo vô hạn.
+    attachmentSendTimeoutMs: Number(process.env.ATTACHMENT_SEND_TIMEOUT_MS) || 120000,
+
+    // ===== Facebook Fanpage (Messenger Platform) =====
+    // ĐỂ TRỐNG pageToken/appSecret = TẮT HẲN kênh Facebook (không đăng ký provider, không mở webhook) —
+    // server chạy y nguyên với mình Zalo. Khác Zalo ở chỗ: KHÔNG đăng nhập QR, mà dùng Page Access Token;
+    // tin ĐẾN do Meta POST vào webhook của mình (nên gateway BẮT BUỘC phải có HTTPS công khai).
+    facebook: {
+        // Page Access Token (KHÔNG phải User token). Sinh từ user token dài hạn thì gần như không hết hạn.
+        pageToken: process.env.FB_PAGE_TOKEN || "",
+        // id của Page — dùng để nhận biết tin nào do CHÍNH PAGE gửi (echo) so với tin của khách.
+        pageId: process.env.FB_PAGE_ID || "",
+        // App Secret — bắt buộc để verify chữ ký X-Hub-Signature-256. Thiếu ⇒ ai cũng giả được tin nhắn.
+        appSecret: process.env.FB_APP_SECRET || "",
+        // Chuỗi do MÌNH tự đặt, điền giống hệt ở ô "Verify Token" trên Meta (bắt tay lúc đăng ký webhook).
+        verifyToken: process.env.FB_VERIFY_TOKEN || "",
+        graphVersion: process.env.FB_GRAPH_VERSION || "v21.0",
     },
 
     // CHỐNG QUÉT/BAN (outboundGuard) — phạm vi "chỉ chống fan-out": KHÔNG ghì lại chat tay 1-1, chỉ giãn

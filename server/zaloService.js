@@ -1,4 +1,5 @@
 import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions, Gender } from "zca-js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -14,6 +15,27 @@ import { OutboundGuard } from "./lib/outboundGuard.js";
 import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Hộp hứng kết quả upload, cô lập theo TỪNG lời gọi gửi. `api.sendMessage` gọi `api.uploadAttachment` bên
+// trong rồi BỎ kết quả đi — mà kết quả đó chính là nơi Zalo trả URL CDN (normalUrl/hdUrl/thumbUrl cho ảnh,
+// fileUrl cho video/file). Bọc lại để giữ, nhờ vậy tin GỬI ĐI có `href` NGAY, không phải chờ echo.
+// Dùng AsyncLocalStorage (không phải biến chung) vì hai lần gửi song song sẽ giành nhau và lẫn URL của nhau.
+const UPLOAD_CAPTURE = new AsyncLocalStorage();
+
+/**
+ * Chặn treo VĨNH VIỄN: trả về promise thua cuộc nếu quá `ms`. Lưu ý — timeout KHÔNG huỷ được việc đang chạy
+ * (không có cách nào rút lại lời gọi đã bay tới Zalo), nên tin VẪN CÓ THỂ tới nơi sau đó. Chấp nhận báo lỗi
+ * "sai âm" để không giữ request treo mãi; echo selfListen về sau vẫn tạo/vá bản ghi như bình thường.
+ */
+function withTimeout(promise, ms, message) {
+    let timer;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(message)), ms);
+        }),
+    ]);
+}
 
 // Giải mã field `data` mã hoá trong response Zalo — NGHỊCH ĐẢO của utils.encodeAES (zca-js): AES-CBC, key =
 // Base64-decode(secretKey), IV = 16 byte 0, PKCS7. zca-js KHÔNG export decodeAES ra ngoài (chặn deep-import)
@@ -1392,6 +1414,13 @@ class ZaloService extends EventEmitter {
             await this._ensureConversationKnown(type, threadId);
         }
 
+        // PHÁT event cho tin MÌNH gửi. Trước đây im lặng vì consumer duy nhất là web client — nó tự thêm tin
+        // vào state khi gọi API nên không cần server phát lại. Nhưng nay còn HỆ THỐNG NGOÀI nghe qua
+        // RabbitMQ: không phát thì tin gửi từ API (Postman/ERP) KHÔNG tồn tại với họ, và web client cũng
+        // không thấy tin do nơi khác gửi. An toàn vì client đã dedup theo `id` trong pushMessage (trùng thì
+        // gộp, không thêm bong bóng thứ hai), và echo selfListen tới sau cũng bị dedup nên không phát trùng.
+        this.emit("message", normalized);
+
         return normalized;
     }
 
@@ -1447,8 +1476,41 @@ class ZaloService extends EventEmitter {
      * trên server mình (để không phụ thuộc CDN Zalo) và đính `attachment.localAttachments` vào bản ghi
      * tin để client hiển thị/tải qua /api/media/local/:id thay vì CDN Zalo (kể cả sau khi F5).
      */
+    /**
+     * Bọc `api.uploadAttachment` MỘT LẦN để hứng kết quả (chứa URL CDN Zalo) mà `sendMessage` gọi nội bộ
+     * rồi bỏ đi. Idempotent nhờ cờ trên chính đối tượng api — đăng nhập lại tạo api MỚI (cờ mất) nên tự
+     * bọc lại. KHÔNG đổi hành vi: vẫn trả nguyên kết quả cho sendMessage dùng tiếp.
+     */
+    _ensureUploadCapture() {
+        if (!this.api || this.api.__uploadCaptureInstalled) return;
+        const orig = this.api.uploadAttachment.bind(this.api);
+        this.api.uploadAttachment = async (...args) => {
+            const res = await orig(...args);
+            const box = UPLOAD_CAPTURE.getStore();
+            if (box) box.result = res;
+            return res;
+        };
+        this.api.__uploadCaptureInstalled = true;
+    }
+
+    /**
+     * Đổi 1 phần tử kết quả upload thành `{href, thumb}` — ĐÚNG shape mà tin NHẬN từ Zalo dùng, để hệ thống
+     * ngoài chỉ phải xử lý MỘT dạng cho cả hai chiều. Ảnh có 3 URL (ưu tiên hdUrl là bản gốc), video/file
+     * chỉ có fileUrl và không kèm thumb.
+     */
+    static _uploadResultToHref(item) {
+        if (!item || typeof item !== "object") return null;
+        if (item.fileType === "image") {
+            const href = item.hdUrl || item.normalUrl || null;
+            if (!href) return null;
+            return { href, ...(item.thumbUrl ? { thumb: item.thumbUrl } : {}) };
+        }
+        return item.fileUrl ? { href: item.fileUrl } : null;
+    }
+
     async sendAttachment(threadId, type, files, caption, dimensions = []) {
         if (!this.api) throw new Error("Chưa đăng nhập");
+        this._ensureUploadCapture();
 
         // Cùng quy ước gộp lô hiển thị (group_layout_id/id_in_group/total_item_in_group/is_group_layout)
         // với tin NHẬN VỀ (xem client/src/utils/mediaGroup.js) — trước đây tin MÌNH gửi/forward không có
@@ -1516,11 +1578,31 @@ class ZaloService extends EventEmitter {
             }),
         );
 
-        const result = await this.guard.run(() =>
-            this.api.sendMessage({ msg: caption ?? "", attachments: sources }, threadId, type),
+        // Chạy trong hộp UPLOAD_CAPTURE để hứng URL CDN Zalo mà uploadAttachment (gọi bên trong
+        // sendMessage) trả về — nhờ đó bản ghi tin có `href` NGAY, không phải chờ echo selfListen.
+        const captureBox = {};
+        const startedAt = Date.now();
+        const desc = files.map((f) => `${f.originalname}(${Math.round(f.size / 1024)}KB)`).join(", ");
+        console.log(`[zalo][ATTACH] Bắt đầu gửi ${files.length} file: ${desc}`);
+        const result = await withTimeout(
+            UPLOAD_CAPTURE.run(captureBox, () =>
+                this.guard.run(() => this.api.sendMessage({ msg: caption ?? "", attachments: sources }, threadId, type)),
+            ),
+            config.attachmentSendTimeoutMs,
+            // Treo ở đây gần như luôn là chờ callback WebSocket của video/file không bao giờ tới.
+            `Gửi đính kèm quá ${config.attachmentSendTimeoutMs}ms (nghi Zalo không trả callback upload cho video/file)`,
         );
+        const sentAt = Date.now();
+        console.log(`[zalo][ATTACH] Gửi Zalo xong sau ${sentAt - startedAt}ms (${files.length} file)`);
+        // Kết quả upload xếp theo ĐÚNG thứ tự `sources` (cùng giả định index mà attResults[i] đang dùng).
+        const uploadResults = Array.isArray(captureBox.result) ? captureBox.result : [];
         // Chờ ghi byte xong (chạy song song ở trên) trước khi backfill msgId/ghi tin dùng insertedIds & localAttachments.
         await persistPromise;
+        // Đo RIÊNG bước ghi byte (Tebi/S3 ở xa → có thể chậm hơn cả việc gửi Zalo). Nếu số này lớn thì
+        // chính nó giữ response, làm giao diện kẹt "đang gửi" dù Zalo đã nhận tin từ lâu.
+        console.log(
+            `[zalo][ATTACH] Lưu byte xong sau ${Date.now() - sentAt}ms — TỔNG ${Date.now() - startedAt}ms`,
+        );
         // zca-js gửi MỖI file thành 1 tin RIÊNG tới Zalo (giống app thật) — msgId thật nằm ở result.attachment[i].
         // Ta cũng TÁCH thành từng bản ghi tin riêng (không gộp 1 bong bóng) để web khớp với Zalo phía nhận, và
         // để mỗi echo tự-gửi dedup đúng theo msgId của nó. Caption: nếu lô nhiều file / không phải ảnh đơn thì
@@ -1555,6 +1637,10 @@ class ZaloService extends EventEmitter {
                     text: captionOnSingleImage ? caption : null,
                     msgType,
                     attachment: {
+                        // href/thumb = URL CDN Zalo bắt được lúc upload → tin GỬI ĐI có cùng shape tin NHẬN
+                        // (trước đây chỉ echo mới vá được href, mà echo không phát event nên hệ thống ngoài
+                        // nhận tin thiếu link file). Thiếu URL thì bỏ trống — echo vẫn vá sau như cũ.
+                        ...(ZaloService._uploadResultToHref(uploadResults[i]) ?? {}),
                         files: [files[i].originalname],
                         localAttachments: localAttachments[i] ? [localAttachments[i]] : [],
                         ...(groupLayoutId && msgType
@@ -1575,6 +1661,33 @@ class ZaloService extends EventEmitter {
         // Trả MẢNG tin (mỗi file 1 tin, kèm tin caption nếu tách riêng) — client push từng tin. Nếu vì lý do
         // nào đó không có tin nào (không nên xảy ra), trả mảng rỗng để client bỏ qua an toàn.
         return messages;
+    }
+
+    /**
+     * [CHẨN ĐOÁN TẠM] CHỈ upload lên CDN Zalo, KHÔNG gửi tin nào — để xem TẬN MẮT Zalo trả URL gì ngay tại
+     * bước upload. Dùng xác nhận hướng "bọc uploadAttachment" trước khi sửa sendAttachment thật.
+     *
+     * Đáng chú ý (xem uploadAttachment.js của zca-js): ẢNH trả normalUrl/hdUrl/thumbUrl NGAY trong HTTP
+     * response, còn VIDEO/FILE phải chờ Zalo bắn callback qua WebSocket mới có fileUrl → promise resolve
+     * CHẬM hơn hẳn. Đó cũng là lý do gửi video lâu, không phải do file nặng.
+     *
+     * GỠ sau khi chốt xong thiết kế.
+     */
+    async uploadAttachmentOnly(threadId, type, files) {
+        if (!this.api) throw new Error("Chưa đăng nhập");
+        const sources = files.map((file) => {
+            // Ảnh THIẾU width/height sẽ bị Zalo dựng sai tỉ lệ — tự đọc từ buffer như sendAttachment làm.
+            const dim = imageSizeOf(file.buffer);
+            return {
+                data: file.buffer,
+                filename: file.originalname,
+                metadata: {
+                    totalSize: file.size,
+                    ...(dim ? { width: dim.width, height: dim.height } : {}),
+                },
+            };
+        });
+        return this.api.uploadAttachment(sources, String(threadId), Number(type));
     }
 
     async sendLink(threadId, type, link, msg) {
