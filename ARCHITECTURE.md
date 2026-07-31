@@ -69,7 +69,12 @@ server/
     blobStore.js        # Kho BYTE file trên đĩa (LocalDiskStore; sẵn sàng đổi S3)
     aiClient.js         # Gọi ai-service (nhận diện ảnh/chép lời/tóm tắt) — chỉ lấy gợi ý
     attachmentType.js · rangeStream.js  # Dò mime (magic bytes) · serve buffer có Range/206
-  providers/            # Khung hub đa nền tảng: MessagingProvider · zalo.js · hub.js · resolve.js
+  providers/            # Hub đa nền tảng: MessagingProvider · hub.js · resolve.js
+                        #   zalo.js      — zca-js, đăng nhập QR, server CHỦ ĐỘNG mở WebSocket ra
+                        #   facebook.js  — Messenger Page, Page token (không QR), Meta ĐẨY webhook VÀO
+  lib/rabbitPublisher.js        # Đẩy event ra RabbitMQ cho hệ thống ngoài (rk `<platform>.message.new`…)
+  lib/rabbitCommandConsumer.js  # Nhận lệnh GỬI từ hệ thống ngoài (queue riêng mỗi kênh)
+  lib/outboundCorrelation.js    # Echo cliMsgId cho tin gửi theo lệnh (chống kẹt "đang gửi" + lưu trùng)
   docs/openapi.js       # Đặc tả Swagger (phục vụ tại /api-docs)
   store/                # Tầng lưu trữ MongoDB (không chứa nghiệp vụ Zalo)
     db.js               # MongoClient + collections + initSchema() (index) + withTransaction() + dataSet()
